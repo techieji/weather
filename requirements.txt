@@ -1,0 +1,6 @@
+numpy
+netCDF4
+cartopy
+jinja2
+pytest
+xarray
