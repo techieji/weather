@@ -8,4 +8,6 @@ RUN git clone https://github.com/aperezhortal/pySPEEDY.git
 COPY requirements.txt requirements.txt
 RUN python3 -m pip install -r requirements.txt
 RUN cd pySPEEDY; ./build.sh
-CMD ["bash"]
+# symlink built package into site-packages
+RUN ln -s /pySPEEDY/pyspeedy /usr/local/lib/python3.11/site-packages/pyspeedy
+CMD cd; bash
