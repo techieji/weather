@@ -4,3 +4,5 @@ cartopy
 jinja2
 pytest
 xarray
+notebook
+matplotlib
