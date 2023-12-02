@@ -1,3 +1,5 @@
 .ipynb_checkpoints/
 pySPEEDY/
 .*
+*.log
+__pycache__/
