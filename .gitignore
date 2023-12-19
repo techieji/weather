@@ -3,3 +3,4 @@ pySPEEDY/
 .*
 *.log
 __pycache__/
+data/

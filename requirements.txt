@@ -4,5 +4,8 @@ cartopy
 jinja2
 pytest
 xarray
+dask
 notebook
 matplotlib
+torch
+ncps
