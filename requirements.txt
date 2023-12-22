@@ -9,3 +9,5 @@ notebook
 matplotlib
 torch
 ncps
+jupyterplot
+scipy
