@@ -6,6 +6,7 @@ import numpy as np
 from scipy.special import roots_legendre
 import os.path
 from dataclasses import dataclass
+from torch import tensor
 
 @dataclass
 class PrognosticVars:
@@ -54,32 +55,36 @@ class Dycore:
 
     @staticmethod
     def gaussian_lats(n):   # Written by ChatGPT, TODO: CHECK!!!
+        if Dycore.LOADED_DATA is not None:
+            return Dycore.LOADED_DATA.lat
         roots, _ = roots_legendre(n)
         return roots * 90
 
-    def set_data(self, **kwargs):
+    @classmethod
+    def _set_data(klass, model, date, **kwargs):
         data = Dycore.load_data(**kwargs)
         vs = data.vars.interp(
             lat=Dycore.gaussian_lats(48),
-            lon=np.linspace(0, 360, 96),
+            lon=np.linspace(0, 360, 97)[:-1],
             level=Dycore.SIGMA_LEVELS * 1000,    # This is not correct, adjust for surface pressure FIXME
-            time=self.date
+            time=date
         ).transpose()
         pres = data.pres.interp(
             lat=Dycore.gaussian_lats(48),
-            lon=np.linspace(0, 360, 96),
-            time=self.date
+            lon=np.linspace(0, 360, 97)[:-1],
+            time=date
         ).transpose()
 
-        #print(self.model['t_grid'])
-        print(vs.air.to_numpy())
+        model['t_grid'] = vs.air
+        model['u_grid'] = vs.uwnd
+        model['v_grid'] = vs.vwnd
+        model['q_grid'] = vs.shum
+        #model['ps_grid'] = pres.pres / 100
+        model.grid2spectral()
+        #model.spectral2grid()
 
-        # self.model['t_grid'] = vs.air
-        # self.model['u_grid'] = vs.uwnd
-        # self.model['v_grid'] = vs.vwnd
-        # self.model['q_grid'] = vs.shum
-        # self.model['ps_grid'] = pres.pres
-        self.model.grid2spectral()
+    def set_data(self, **kwargs):
+        Dycore._set_data(self.model, self.date, **kwargs)
 
     @classmethod
     def load_data(klass, data_loc='~/data', force=False):
