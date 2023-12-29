@@ -20,14 +20,14 @@ DATA = None
 
 PRED_VARS = 'uwind vwind air shum'.split()    # phi ps
 VAR_N = len(PRED_VARS)
-LEVELS = 8
+LEVELS = 17
 CONSTANTS = 'orog lsm alb vegh vegl'.split()
 
 N_CONVS = 1
-GLOBAL_TILE = 20
-CONVOL_TILE = 10
+GLOBAL_TILE = 5  # Like a radius
+CONVOL_TILE = 3
 OUTPUT_TILE = 3
-TIME_LENGTH = 20
+TIME_LENGTH = 7
 
 LTC_SPARSITY = 0.8
 
@@ -80,15 +80,13 @@ def slice_time(df, t):
 def sel_const(loni, lati):
     global const_sel, _const_sel
     const_sel = slice_pos(CONST_TABLE, loni, lati).to_dataarray().transpose()
-    _const_sel = torch.asarray(const_sel.to_numpy()).unbind()
+    _const_sel = torch.asarray(const_sel.to_numpy())
     return const_sel
 
-def to_tensor(df, swap_from=0, swap_to=1):    # time x vars x lon x lat x level
-    return torch.asarray(np.moveaxis(
-        df.to_dataarray().to_numpy(),
-        swap_from,
-        swap_to
-    ))
+def to_tensors(arr):    # time x vars x lon x lat x level
+    return torch.nan_to_num(torch.asarray(arr.to_numpy())).to(torch.float32)
+    #for a in arr:
+    #    yield torch.nan_to_num(torch.asarray(a.to_numpy())).to(torch.float32)
 
 def random_pos(): # raw values: lon, lat, time
     posw = GLOBAL_TILE
@@ -102,7 +100,8 @@ def random_pos(): # raw values: lon, lat, time
 def random_slice():
     loni, lati, ti = random_pos()
     sel_const(loni, lati)
-    return slice_pos(slice_time(DATA.vars, ti), loni, lati)
+    tens = slice_pos(slice_time(DATA.vars, ti), loni, lati).to_dataarray()
+    return tens.transpose('time', 'variable', 'lon', 'lat', 'level')
 
 class VarEncoder(nn.Module):
     def __init__(self, inp, out):
@@ -117,19 +116,21 @@ class VarEncoder(nn.Module):
         return self.seq(x)
 
 class CrossConnector(nn.Module):
-    def __init__(self, tile_size, ntiles, interm, output):
+    def __init__(self, tile_size, ntiles, interm, output, tile_dim=3):
         super().__init__()
+        # batch is optional
+        # batch x ntiles x [[tile_size]:tile_dim] => batch x interm => batch x output
         self.seq = nn.Sequential(
-                nn.Flatten(),
-                nn.Linear(tile_size, tile_size),
+                nn.Flatten(-tile_dim, -1),
+                nn.Linear(tile_size, tile_size),   # TODO: replace with VarEncoder
                 nn.Sigmoid(),
                 nn.Linear(tile_size, (tile_size + interm) // 2),
                 nn.Sigmoid(),
                 nn.Linear((tile_size + interm) // 2, interm),
                 nn.Sigmoid(),
                 # Tiles turned into interm
-                nn.Flatten(0, -1),
-                nn.Linear(ntiles*interm, ntiles*interm),
+                nn.Flatten(-2, -1),
+                nn.Linear(ntiles*interm, ntiles*interm),   # TODO: replace with VarEncoder
                 nn.Sigmoid(),
                 nn.Linear(ntiles*interm, (ntiles*interm + output) // 2),
                 nn.Sigmoid(),
@@ -140,7 +141,7 @@ class CrossConnector(nn.Module):
         # x: vars x (pos)
         return self.seq(x)
 
-class RegionEncoder(nn.Module):
+class RegionEncoder(nn.Module):   # TODO: optimize for functional programming
     def __init__(self):
         # Channels:
         #   Prognostic vars: u, v, t, q, phi, ps
@@ -154,34 +155,52 @@ class RegionEncoder(nn.Module):
         # 2. Mix vars (applied by lon, lat, t)     => ps-vars x (lon x lat x level)
         self.mixer = VarEncoder(VAR_N, VAR_N)
         # 3. Apply n 3D convolution seperately     => ps-vars x (lon x lat x level) [mostly]
-        self.convs = [[nn.Conv3d(VAR_N, VAR_N, CONVOL_TILE, groups=VAR_N) for _ in PRED_VARS] for _ in range(N_CONVS)]
+        self.convs = [nn.Conv3d(VAR_N, VAR_N, CONVOL_TILE) for _ in range(N_CONVS)]
         # 4. Pool for each pseudo-var              => ps-vars x (output x output x output)
         self.pool = nn.AdaptiveMaxPool3d(OUTPUT_TILE)
         # 5. Fully connected linear layers         => ps-vars x level [homogenous]
         self.layer = CrossConnector(OUTPUT_TILE**3, VAR_N, VAR_N*LEVELS, VAR_N*LEVELS)
 
-    def forward(self, x):
+    def forward(self, x):    # TODO: make all dimensions negative to allow efficient application
+        # TODO: allow batch to be optional
         # (pos) = lon x lat x level
-        # x: vars x (pos)
+        # x: batch x vars x (pos)
         x = self.dropout(x)
-        # vs: (pos) x vars
-        vs = torch.movedim(torch.stack(
-            [enc(torch.stack([var] + _const_sel)) for var, enc in zip(torch.unbind(x), self.encs)]
-        ), (1, 2, 3), (0, 1, 2))
-        # pvs: pvars x (pos)
-        pvs = torch.movedim(self.mixer(vs), (0, 1, 2), (1, 2, 3))
-        for convs in self.convs:
-            pvs = torch.stack([conv(var) for var, conv in zip(torch.unbind(pvs), convs)])
+        # vs: batch x (pos) x vars
+        vs = torch.stack(
+            [enc(torch.cat((
+                var, _const_sel.unsqueeze(0).repeat(var.shape[0], *[1]* 3)   # 3 is num of dims of _const_sel
+            ), dim=-1)) for var, enc in zip(x.unbind(1), self.encs)]
+        ).transpose(0, 1).movedim((-1, -2, -3), (-2, -3, -4))
+        # pvs: batch x pvars x (pos)
+        pvs = torch.movedim(self.mixer(vs), (-2, -3, -4), (-1, -2, -3))
+        for conv in self.convs:
+            pvs = conv(pvs)
         pvs = self.pool(pvs)
+        # returns (1D): batch x level * vars
         return self.layer(pvs)
 
 class LiquidOperator(nn.Module):
-    def __init__(self):
+    def __init__(self, pred_n=4):
         super().__init__()
 
-        # 6. LTC                                   => vars x level
-        self.wiring = AutoNCP(3*VAR_N*LEVELS, VAR_N*LEVELS, sparsity_level=LTC_SPARSITY)
-        self.ltc = LTC(VAR_N*LEVELS, wiring)
+        # 6. Fully connected preprocessing layer   => time x vars * level
+        self.preproc = VarEncoder(VAR_N*LEVELS, VAR_N*LEVELS)
+        # 7. LTC                                   => time x vars x level
+        self.pred_n = pred_n
+        self.wiring = AutoNCP(3*LEVELS, LEVELS, sparsity_level=LTC_SPARSITY)  # TODO: investigate whether different wirings need to be created
+        self.ltcs = [LTC(LEVELS, self.wiring) for _ in range(VAR_N)]
+        # 8. Fully connected postprocessing layers => time x vars * level
+        self.postproc = CrossConnector(LEVELS, VAR_N, VAR_N*LEVELS, VAR_N*LEVELS, tile_dim=1)
 
     def forward(self, x):
-        pass
+        # xs: vars x (time x level)
+        xs = self.preproc(x).reshape((-1, VAR_N, LEVELS)).unbind(1)
+        # r: time x vars x level
+        rs = torch.stack(
+            [ltc(torch.cat((ts, ts[-1].repeat(self.pred_n, 1))))[0] for ltc, ts in zip(self.ltcs, xs)]   # ts: time x level
+        ).transpose(0, 1)
+        #r = torch.stack([ltc(
+        #    torch.cat((x[:,i::VAR_N], x[-1,i::VAR_N].repeat(self.pred_n, 1)))   # TODO: fix repeat
+        #)[0] for i, ltc in enumerate(self.ltcs)])
+        return self.postproc(rs)
