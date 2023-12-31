@@ -14,7 +14,7 @@ model = nn.WeatherPredictor()
 
 LR = 0.1
 
-optim = torch.optim.SGD(model.parameters(), lr=LR)
+optim = torch.optim.Adam(model.parameters(), lr=LR)
 loss = torch.nn.MSELoss()
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optim)
 
@@ -70,6 +70,9 @@ class Validator:
                 losses.append(calc_loss(sl,train_mode=False))
             return sum(losses)/len(losses)
 
+def advance_world(world, t, model=model):
+    pass
+
 validate = Validator()
 
 def save_onnx():
@@ -85,9 +88,9 @@ def main(epoch_count=100):
     last_val_loss = np.inf
     stop_n = 0
     for i in range(epoch_count):
-        # if stop_n > 3:
-        #     print('Training stopped')
-        #     break
+        if stop_n > 5:
+            print('Training stopped')
+            break
         try:
             train_loss = train(n=1)
             val_loss = validate().sum()
