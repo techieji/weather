@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import tensor
 from ncps.torch import LTC
 from ncps.wirings import AutoNCP
@@ -11,6 +12,8 @@ import os.path
 
 rng = np.random.default_rng(seed=1)
 
+ONNX_EXPORT = False
+
 CONST_TABLE = None
 const_sel = None
 _const_sel = None
@@ -18,18 +21,20 @@ _const_sel = None
 RAW_DATA = None
 DATA = None
 
-PRED_VARS = 'uwind vwind air shum'.split()    # phi ps
+PRED_VARS = 'uwind vwind air shum'.split()    # Add phi ps
 VAR_N = len(PRED_VARS)
 LEVELS = 17
 CONSTANTS = 'orog lsm alb vegh vegl'.split()
 
 N_CONVS = 1
-GLOBAL_TILE = 5  # Like a radius
+GLOBAL_TILE = 9  # Like a radius
 CONVOL_TILE = 3
 OUTPUT_TILE = 3
-TIME_LENGTH = 7
+TIME_LENGTH = 10
 
 LTC_SPARSITY = 0.8
+
+PRED_N = 28
 
 fields = len(PRED_VARS) * LEVELS + len(CONSTANTS)
 
@@ -53,7 +58,7 @@ def load_data(data_loc='~/data', force=False):
         DATA = PrognosticVars(
             vars=RAW_DATA.vars.interp(lon=CONST_TABLE.lon, lat=CONST_TABLE.lat),
             pres=RAW_DATA.pres.interp(lon=CONST_TABLE.lon, lat=CONST_TABLE.lat)
-        )
+        )   # TODO find new boundary conditions or upsample CONST_TABLE
     return DATA
 
 def load_const_table(location='/pySPEEDY/pyspeedy/data/example_bc.nc', force=False):
@@ -69,12 +74,20 @@ def load_all():
     load_data()
     print("Data loaded")
 
+def is_data_loaded():
+    return CONST_TABLE is not None and DATA is not None
+
+def mod_iter(i, mod):
+    return map(lambda x: x % mod, i)
+
 def slice_pos(df, loni, lati):
     posw = GLOBAL_TILE
-    return df.sel(lon=df.lon[loni-posw:loni+posw], lat=df.lat[lati-posw:lati+posw])
+    lonr = [x % len(df.lon) for x in range(loni-posw, loni+posw-1)]
+    latr = [x % len(df.lat) for x in range(lati-posw, lati+posw-1)]
+    return df.sel(lon=df.lon[lonr], lat=df.lat[latr])
 
 def slice_time(df, t):
-    tlen = TIME_LENGTH
+    tlen = TIME_LENGTH + PRED_N
     return df.sel(time=df.time[t:t+tlen])
 
 def sel_const(loni, lati):
@@ -85,15 +98,13 @@ def sel_const(loni, lati):
 
 def to_tensors(arr):    # time x vars x lon x lat x level
     return torch.nan_to_num(torch.asarray(arr.to_numpy())).to(torch.float32)
-    #for a in arr:
-    #    yield torch.nan_to_num(torch.asarray(a.to_numpy())).to(torch.float32)
 
 def random_pos(): # raw values: lon, lat, time
     posw = GLOBAL_TILE
     tlen = TIME_LENGTH
     df = load_data().vars
-    loni = rng.integers(posw, len(df.lon) - posw)
-    lati = rng.integers(posw, len(df.lat) - posw)
+    loni = rng.integers(0, len(df.lon))
+    lati = rng.integers(0, len(df.lat))
     ti = rng.integers(0, len(df.time) - tlen)
     return loni, lati, ti
 
@@ -102,6 +113,18 @@ def random_slice():
     sel_const(loni, lati)
     tens = slice_pos(slice_time(DATA.vars, ti), loni, lati).to_dataarray()
     return tens.transpose('time', 'variable', 'lon', 'lat', 'level')
+
+class AdaptiveMaxPool3dCustom(nn.Module):     # For ONNX compatibility
+    def __init__(self, output_size):
+        super().__init__()
+        self.output_size = np.array(output_size)
+
+    def forward(self, x: torch.Tensor):
+        stride_size = np.floor(np.array(x.shape[-3:]) / self.output_size).astype(np.int32)
+        kernel_size = np.array(x.shape[-3:]) - (self.output_size - 1) * stride_size
+        avg = nn.MaxPool3d(kernel_size=list(kernel_size), stride=list(stride_size))
+        x = avg(x)
+        return x
 
 class VarEncoder(nn.Module):
     def __init__(self, inp, out):
@@ -157,7 +180,10 @@ class RegionEncoder(nn.Module):   # TODO: optimize for functional programming
         # 3. Apply n 3D convolution seperately     => ps-vars x (lon x lat x level) [mostly]
         self.convs = [nn.Conv3d(VAR_N, VAR_N, CONVOL_TILE) for _ in range(N_CONVS)]
         # 4. Pool for each pseudo-var              => ps-vars x (output x output x output)
-        self.pool = nn.AdaptiveMaxPool3d(OUTPUT_TILE)
+        if ONNX_EXPORT:
+            self.pool = AdaptiveMaxPool3dCustom(OUTPUT_TILE)
+        else:
+            self.pool = nn.AdaptiveMaxPool3d(OUTPUT_TILE)
         # 5. Fully connected linear layers         => ps-vars x level [homogenous]
         self.layer = CrossConnector(OUTPUT_TILE**3, VAR_N, VAR_N*LEVELS, VAR_N*LEVELS)
 
@@ -169,7 +195,7 @@ class RegionEncoder(nn.Module):   # TODO: optimize for functional programming
         # vs: batch x (pos) x vars
         vs = torch.stack(
             [enc(torch.cat((
-                var, _const_sel.unsqueeze(0).repeat(var.shape[0], *[1]* 3)   # 3 is num of dims of _const_sel
+                var, _const_sel.unsqueeze(0).repeat(*var.shape[:-3], *[1]* 3)   # 3 is num of dims of _const_sel  FIXME check if this works
             ), dim=-1)) for var, enc in zip(x.unbind(1), self.encs)]
         ).transpose(0, 1).movedim((-1, -2, -3), (-2, -3, -4))
         # pvs: batch x pvars x (pos)
@@ -181,17 +207,19 @@ class RegionEncoder(nn.Module):   # TODO: optimize for functional programming
         return self.layer(pvs)
 
 class LiquidOperator(nn.Module):
-    def __init__(self, pred_n=4):
+    def __init__(self):
         super().__init__()
 
         # 6. Fully connected preprocessing layer   => time x vars * level
         self.preproc = VarEncoder(VAR_N*LEVELS, VAR_N*LEVELS)
         # 7. LTC                                   => time x vars x level
-        self.pred_n = pred_n
         self.wiring = AutoNCP(3*LEVELS, LEVELS, sparsity_level=LTC_SPARSITY)  # TODO: investigate whether different wirings need to be created
         self.ltcs = [LTC(LEVELS, self.wiring) for _ in range(VAR_N)]
         # 8. Fully connected postprocessing layers => time x vars * level
         self.postproc = CrossConnector(LEVELS, VAR_N, VAR_N*LEVELS, VAR_N*LEVELS, tile_dim=1)
+
+    @property
+    def pred_n(self): return PRED_N
 
     def forward(self, x):
         # xs: vars x (time x level)
@@ -200,7 +228,19 @@ class LiquidOperator(nn.Module):
         rs = torch.stack(
             [ltc(torch.cat((ts, ts[-1].repeat(self.pred_n, 1))))[0] for ltc, ts in zip(self.ltcs, xs)]   # ts: time x level
         ).transpose(0, 1)
-        #r = torch.stack([ltc(
-        #    torch.cat((x[:,i::VAR_N], x[-1,i::VAR_N].repeat(self.pred_n, 1)))   # TODO: fix repeat
-        #)[0] for i, ltc in enumerate(self.ltcs)])
         return self.postproc(rs)
+
+def persistence_model(x):
+    # lt: var x level
+    lt = x[-1,:,GLOBAL_TILE,GLOBAL_TILE,:]
+    return lt.flatten(1).repeat(TIME_LENGTH + PRED_N, 1, 1).flatten(1)
+
+class WeatherPredictor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.re = RegionEncoder()
+        self.lo = LiquidOperator()
+        self.base_model = persistence_model
+
+    def forward(self, x):
+        return self.lo(self.re(x)) + self.base_model(x)
