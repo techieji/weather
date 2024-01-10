@@ -12,6 +12,8 @@ import os.path
 
 rng = np.random.default_rng(seed=1)
 
+USE_ANOMALIES = True
+
 ONNX_EXPORT = False
 
 CONST_TABLE = None
@@ -20,6 +22,9 @@ _const_sel = None
 
 RAW_DATA = None
 DATA = None
+CLIM_AVG = None
+anom_sel = None
+_anom_sel = None
 
 PRED_VARS = 'uwind vwind air shum'.split()    # Add phi ps
 VAR_N = len(PRED_VARS)
@@ -32,9 +37,11 @@ CONVOL_TILE = 3
 OUTPUT_TILE = 3
 TIME_LENGTH = 10
 
-LTC_SPARSITY = 0.5
+LTC_SPARSITY = 0.3
 
 PRED_N = 28
+
+act = nn.Sigmoid    # nn.SELU
 
 fields = len(PRED_VARS) * LEVELS + len(CONSTANTS)
 
@@ -68,14 +75,28 @@ def load_const_table(location='/pySPEEDY/pyspeedy/data/example_bc.nc', force=Fal
         CONST_TABLE = data[CONSTANTS]
     return CONST_TABLE
 
+def load_clim_avg(location='~/data/clim_avg.nc'):
+    global CLIM_AVG
+    slicen = 1461
+    CLIM_AVG = DATA.vars.isel(time=slice(0, 1461))
+    for i in range(len(DATA.vars.time)//slicen):
+        idf = DATA.vars.isel(time=slice(i*slicen, (i+1)*slicen))
+        idf['time'] = CLIM_AVG.time
+        CLIM_AVG += idf
+    CLIM_AVG = CLIM_AVG.interpolate_na(method='linear', fill_value='extrapolate')
+    return CLIM_AVG
+
 def load_all():
     load_const_table()
     print("Constants loaded")
     load_data()
     print("Data loaded")
+    if USE_ANOMALIES:
+        load_clim_avg()
+        print("Climatological average loaded")
 
 def is_data_loaded():
-    return CONST_TABLE is not None and DATA is not None
+    return CONST_TABLE is not None and DATA is not None and (not USE_ANOMALIES or CLIM_AVG is not None)
 
 def mod_iter(i, mod):
     return map(lambda x: x % mod, i)
@@ -84,17 +105,32 @@ def slice_pos(df, loni, lati):
     posw = GLOBAL_TILE
     lonr = [x % len(df.lon) for x in range(loni-posw, loni+posw-1)]
     latr = [x % len(df.lat) for x in range(lati-posw, lati+posw-1)]
-    return df.sel(lon=df.lon[lonr], lat=df.lat[latr])
+    return df.isel(lon=lonr, lat=latr)
 
 def slice_time(df, t):
     tlen = TIME_LENGTH + PRED_N
     return df.sel(time=df.time[t:t+tlen])
 
-def sel_const(loni, lati):
+def sel_const(loni, lati, raise_errors=True):
     global const_sel, _const_sel
-    const_sel = slice_pos(CONST_TABLE, loni, lati).to_dataarray().transpose()
-    _const_sel = torch.asarray(const_sel.to_numpy())
-    return const_sel
+    try:
+        const_sel = slice_pos(CONST_TABLE, loni, lati).to_dataarray().transpose()
+        _const_sel = torch.asarray(const_sel.to_numpy())
+        return const_sel
+    except Exception as e:
+        if raise_errors:
+            raise e
+
+def sel_anom(loni, lati, ti, raise_errors=True):   # TODO: very similar to sel_const, try to merge
+    global anom_sel, _anom_sel
+    try:
+        # anom_sel (1D): level
+        anom_sel = slice_time(CLIM_AVG, ti).isel(lon=loni, lat=lati).to_dataarray().transpose('time', 'level', 'variable')
+        _anom_sel = torch.asarray(anom_sel.to_numpy())
+        return anom_sel
+    except Exception as e:
+        if raise_errors:
+            raise e
 
 def to_tensors(arr):    # time x vars x lon x lat x level
     return torch.nan_to_num(torch.asarray(arr.to_numpy())).to(torch.float32)
@@ -108,31 +144,31 @@ def random_pos(): # raw values: lon, lat, time
     ti = rng.integers(0, len(df.time) - tlen)
     return loni, lati, ti
 
-def random_slice():
+def random_slice(raise_errors=True):
     loni, lati, ti = random_pos()
-    sel_const(loni, lati)
-    tens = slice_pos(slice_time(DATA.vars, ti), loni, lati).to_dataarray()
-    return tens.transpose('time', 'variable', 'lon', 'lat', 'level')
-
-class AdaptiveMaxPool3dCustom(nn.Module):     # For ONNX compatibility
-    def __init__(self, output_size):
-        super().__init__()
-        self.output_size = np.array(output_size)
-
-    def forward(self, x: torch.Tensor):
-        stride_size = np.floor(np.array(x.shape[-3:]) / self.output_size).astype(np.int32)
-        kernel_size = np.array(x.shape[-3:]) - (self.output_size - 1) * stride_size
-        avg = nn.MaxPool3d(kernel_size=list(kernel_size), stride=list(stride_size))
-        x = avg(x)
-        return x
+    sel_const(loni, lati, raise_errors=raise_errors)
+    if USE_ANOMALIES:
+        sel_anom(loni, lati, ti % 1461, raise_errors=raise_errors)
+    try:
+        tens = slice_pos(slice_time(DATA.vars, ti), loni, lati).to_dataarray()
+        return tens.transpose('time', 'variable', 'lon', 'lat', 'level')
+    except Exception as e:
+        if raise_errors:
+            raise e
 
 class VarEncoder(nn.Module):
     def __init__(self, inp, out):
         super().__init__()
         self.seq = nn.Sequential(
             nn.Linear(inp, inp),
-            nn.Sigmoid(),
-            nn.Linear(inp, out)
+            act(),
+            nn.Linear(inp, inp),
+            act(),
+            nn.Linear(inp, out),
+            act(),
+            nn.Linear(out, out),
+            act(),
+            nn.Linear(out, out)
         )
 
     def forward(self, x):
@@ -141,23 +177,15 @@ class VarEncoder(nn.Module):
 class CrossConnector(nn.Module):
     def __init__(self, tile_size, ntiles, interm, output, tile_dim=3):
         super().__init__()
-        # batch is optional
+        # batch is optiona
         # batch x ntiles x [[tile_size]:tile_dim] => batch x interm => batch x output
         self.seq = nn.Sequential(
                 nn.Flatten(-tile_dim, -1),
-                nn.Linear(tile_size, tile_size),   # TODO: replace with VarEncoder
-                nn.Sigmoid(),
-                nn.Linear(tile_size, (tile_size + interm) // 2),
-                nn.Sigmoid(),
-                nn.Linear((tile_size + interm) // 2, interm),
-                nn.Sigmoid(),
+                VarEncoder(tile_size, interm),
+                act(),
                 # Tiles turned into interm
                 nn.Flatten(-2, -1),
-                nn.Linear(ntiles*interm, ntiles*interm),   # TODO: replace with VarEncoder
-                nn.Sigmoid(),
-                nn.Linear(ntiles*interm, (ntiles*interm + output) // 2),
-                nn.Sigmoid(),
-                nn.Linear((ntiles*interm + output) // 2, output)
+                VarEncoder(ntiles*interm, output),
         )
 
     def forward(self, x):
@@ -181,7 +209,7 @@ class RegionEncoder(nn.Module):   # TODO: optimize for functional programming
         self.convs = [nn.Conv3d(VAR_N, VAR_N, CONVOL_TILE) for _ in range(N_CONVS)]
         # 4. Pool for each pseudo-var              => ps-vars x (output x output x output)
         if ONNX_EXPORT:
-            self.pool = AdaptiveMaxPool3dCustom(OUTPUT_TILE)
+            print('Unsupported')
         else:
             self.pool = nn.AdaptiveMaxPool3d(OUTPUT_TILE)
         # 5. Fully connected linear layers         => ps-vars x level [homogenous]
@@ -244,3 +272,13 @@ class WeatherPredictor(nn.Module):
 
     def forward(self, x):
         return self.lo(self.re(x)) + self.base_model(x)
+
+def anomaly_correlation(x, y, c):
+    '''Calculate the anomaly correlation for a forecase.
+
+    x: actual weather
+    y: forecasted weather
+    c: climatology value (climatological mean)'''
+    xa = x - c
+    ya = y - c
+    return (xa * ya).nansum() * torch.rsqrt((xa**2).nansum() * (ya**2).nansum())
