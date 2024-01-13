@@ -136,9 +136,19 @@ if __name__ == '__main__':
     parser.add_argument('-f', '--file')
     parser.add_argument('-e', '--epoch-count', type=int, default=50)
     parser.add_argument('-s', '--stop-num', type=int, default=5)
+    parser.add_argument('-t', '--test-forwards', action='store_true')
     args = parser.parse_args()
     if args.file is not None:
         state_dict = torch.load(args.file)
         model.load_state_dict(state_dict)
-    setup()
-    main(epoch_count=args.epoch_count, stop_limit=args.stop_num)
+    if args.test_forwards:
+        diam = 2*nn.GLOBAL_TILE - 1
+        nn._const_sel = torch.zeros((diam, diam, nn.VAR_C))
+        sl = torch.zeros((nn.TIME_LENGTH, nn.VAR_N, diam, diam, nn.LEVELS))
+        print('Starting test')
+        model = nn.WeatherPredictor()
+        model(sl)
+        print('Success!')
+    else:
+        setup()
+        main(epoch_count=args.epoch_count, stop_limit=args.stop_num)

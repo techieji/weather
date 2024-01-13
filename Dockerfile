@@ -7,14 +7,8 @@ RUN apt-get install -y libgeos-dev libnetcdf-dev libnetcdff-dev
 COPY requirements.txt requirements.txt
 RUN python3 -m pip install -r requirements.txt
 
-#### Install pySPEEDY ##################################################
-
+# To download the boundary conditions (TODO: get a better method)
 RUN git clone https://github.com/aperezhortal/pySPEEDY.git
-ENV NETCDF=/usr
-RUN cd pySPEEDY; ./build.sh
-RUN ln -s /pySPEEDY/pyspeedy/ /usr/local/lib/python3.11/site-packages/pyspeedy
-
-#### Run Jupyter notebook ##############################################
 
 WORKDIR /root
 CMD jupyter notebook --ip 0.0.0.0 --no-browser --allow-root

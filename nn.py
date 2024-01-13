@@ -30,6 +30,7 @@ PRED_VARS = 'uwind vwind air shum'.split()    # Add phi ps
 VAR_N = len(PRED_VARS)
 LEVELS = 17
 CONSTANTS = 'orog lsm alb vegh vegl'.split()
+VAR_C = len(CONSTANTS)
 
 N_CONVS = 1
 GLOBAL_TILE = 9  # Like a radius
@@ -177,7 +178,7 @@ class VarEncoder(nn.Module):
 class CrossConnector(nn.Module):
     def __init__(self, tile_size, ntiles, interm, output, tile_dim=3):
         super().__init__()
-        # batch is optiona
+        # batch is optional
         # batch x ntiles x [[tile_size]:tile_dim] => batch x interm => batch x output
         self.seq = nn.Sequential(
                 nn.Flatten(-tile_dim, -1),
@@ -234,6 +235,42 @@ class RegionEncoder(nn.Module):   # TODO: optimize for functional programming
         # returns (1D): batch x level * vars
         return self.layer(pvs)
 
+class Predictor(nn.Module):
+    def __init__(self, model, state, predn, dim=-2):
+        super().__init__()
+
+        self.model = model
+        self.dim = dim
+        self.state = state
+        self.predn = predn
+
+    def forward(self, x):
+        # x: time x level
+        l = []
+        if type(x) is torch.Tensor: x = x.unbind(dim=self.dim)
+        # Feed in the given data
+        for step in x:
+            step = step.unsqueeze(0)
+            v, self.state = self.model(step, self.state)
+            l.append(v)
+        # Run the prediction using previous predictions
+        for _ in range(self.predn):
+            v, self.state = self.model(v)
+            l.append(v)
+        return torch.stack(l, dim=self.dim)
+
+def PredLTC(predn, inputs, outputs, ncells=None, sparsity=0.5):
+    if ncells is None:
+        ncells = int(outputs//0.3)
+
+    wiring = AutoNCP(ncells, outputs, sparsity_level=sparsity)
+    lnn = LTC(inputs, wiring)
+    return Predictor(lnn, torch.zeros(ncells), predn)
+
+def PredLSTM(predn, inputs, outputs, nlayers=1):
+    lstm = nn.LSTM(inputs, outputs, num_layers=nlayers)
+    return Predictor(lstm, (torch.zeros((nlayers, outputs)), torch.zeros((nlayers, outputs))), predn)
+
 class LiquidOperator(nn.Module):
     def __init__(self):
         super().__init__()
@@ -241,22 +278,27 @@ class LiquidOperator(nn.Module):
         # 6. Fully connected preprocessing layer   => time x vars * level
         self.preproc = VarEncoder(VAR_N*LEVELS, VAR_N*LEVELS)
         # 7. LTC                                   => time x vars x level
-        self.wiring = AutoNCP(3*LEVELS, LEVELS, sparsity_level=LTC_SPARSITY)  # TODO: investigate whether different wirings need to be created
-        self.ltcs = [LTC(LEVELS, self.wiring) for _ in range(VAR_N)]
+        self.ltcs = [PredLTC(predn=self.pred_n, inputs=LEVELS, outputs=LEVELS, sparsity=0.5) for _ in range(VAR_N)]
         # 8. Fully connected postprocessing layers => time x vars * level
         self.postproc = CrossConnector(LEVELS, VAR_N, VAR_N*LEVELS, VAR_N*LEVELS, tile_dim=1)
 
     @property
-    def pred_n(self): return PRED_N
+    def pred_n(self):
+        return PRED_N
 
     def forward(self, x):
-        # xs: vars x (time x level)
-        xs = self.preproc(x).reshape((-1, VAR_N, LEVELS)).unbind(1)
+        # xs: vars x time x level
+        xs = self.preproc(x).reshape((VAR_N, -1, LEVELS)).unbind()
+        # vs: time x vars x level
+        vs = torch.concat([ltc(x) for ltc, x in zip(self.ltcs, xs)]).transpose(0, 1)
         # r: time x vars x level
-        rs = torch.stack(
-            [ltc(torch.cat((ts, ts[-1].repeat(self.pred_n, 1))))[0] for ltc, ts in zip(self.ltcs, xs)]   # ts: time x level
-        ).transpose(0, 1)
-        return self.postproc(rs)
+        return self.postproc(vs)
+
+class LSTMOperator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.preproc = VarEncoder(VAR_N*LEVELS, VAR_N*LEVELS)
+        self.lstm = nn.LSTM(VAR_N*LEVELS, VAR_N*LEVELS)
 
 def persistence_model(x):
     # lt: var x level

@@ -7,8 +7,7 @@ image: data
 data:
 	mkdir data
 	cd data;\
-	curl -Z --user anonymous: --remote-name 'ftp://ftp2.psl.noaa.gov/Datasets/ncep.reanalysis/pressure/{uwnd,vwnd,shum,air,hgt,../surface/pres.sfc}.[2000-2000].nc'
+	curl -Z --user anonymous: --remote-name 'ftp://ftp2.psl.noaa.gov/Datasets/ncep.reanalysis/pressure/{uwnd,vwnd,shum,air,hgt,../surface/pres.sfc}.[1999-2001].nc'
 
 clean:
 	rm data -rf
-	rm *.nc
