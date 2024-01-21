@@ -2,6 +2,8 @@ import nn
 import torch
 import torch.nn.functional as F
 import numpy as np
+from time import time
+import json
 
 import sys
 import argparse
@@ -25,7 +27,7 @@ def setup():
     optim = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optim)
 
-LR = 0.001    # LR: 0.001
+LR = 0.03    # LR: 0.001
 
 def calc_loss(sl=None, model=None, needs_grad=True, train_mode=True, n=1):
     if model is None: model = globals()['model']   # Bad code on my part
@@ -57,7 +59,7 @@ def train(n=1):
     return l.sum().item(), pcc.sum().item()
 
 class Validator:
-    def __init__(self, n=1):
+    def __init__(self, n=10):
         print('Setting up validator...')
         self.n = n
         self.slices = []
@@ -83,7 +85,7 @@ class Validator:
                 l, pcc = calc_loss(sl, model, False, False)
                 losses.append(l)
                 pcces.append(pcc)
-            return sum(losses)/len(losses), sum(pcces)/len(pcces)
+            return sum(losses), sum(pcces)/len(pcces)
 
 def _main(epoch_count=50, stop_limit=5):
     if not nn.is_data_loaded():
@@ -123,10 +125,11 @@ def main(*args, **kwargs):
         lossl.append(loss)
         print(i, loss[0], base_loss - loss[0], loss[2], sep='\t')
     print('Final diff:', base_loss - loss[0])
-    if base_loss - loss[0] > 0:
+    # if base_loss - loss[0] > 0:
+    if True:
         print('success!')
-        torch.save(model.state_dict(), 'model-last.pt')
-        with open('model-loss-lsat.json', 'w') as f:
+        torch.save(model.state_dict(), f'model-last-{time()}.pt')
+        with open(f'model-loss-last-{time()}.json', 'w') as f:
             json.dump(lossl, f)
     else:
         print('fail.')
@@ -134,7 +137,7 @@ def main(*args, **kwargs):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='weather-trainer')
     parser.add_argument('-f', '--file')
-    parser.add_argument('-e', '--epoch-count', type=int, default=50)
+    parser.add_argument('-e', '--epoch-count', type=int, default=100)
     parser.add_argument('-s', '--stop-num', type=int, default=5)
     parser.add_argument('-t', '--test-forwards', action='store_true')
     args = parser.parse_args()

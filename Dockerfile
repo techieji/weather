@@ -11,4 +11,5 @@ RUN python3 -m pip install -r requirements.txt
 RUN git clone https://github.com/aperezhortal/pySPEEDY.git
 
 WORKDIR /root
-CMD jupyter notebook --ip 0.0.0.0 --no-browser --allow-root
+# CMD jupyter notebook --ip 0.0.0.0 --no-browser --allow-root
+CMD bash

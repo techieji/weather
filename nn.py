@@ -33,14 +33,14 @@ CONSTANTS = 'orog lsm alb vegh vegl'.split()
 VAR_C = len(CONSTANTS)
 
 N_CONVS = 1
-GLOBAL_TILE = 9  # Like a radius
+GLOBAL_TILE = 3  # Like a radius
 CONVOL_TILE = 3
 OUTPUT_TILE = 3
 TIME_LENGTH = 10
 
-LTC_SPARSITY = 0.3
+LTC_SPARSITY = 0.5
 
-PRED_N = 28
+PRED_N = 12
 
 act = nn.Sigmoid    # nn.SELU
 
@@ -140,8 +140,10 @@ def random_pos(): # raw values: lon, lat, time
     posw = GLOBAL_TILE
     tlen = TIME_LENGTH
     df = load_data().vars
-    loni = rng.integers(0, len(df.lon))
-    lati = rng.integers(0, len(df.lat))
+    #loni = rng.integers(0, len(df.lon))
+    #lati = rng.integers(0, len(df.lat))
+    loni = rng.integers(0, 10)
+    lati = rng.integers(12, 36)
     ti = rng.integers(0, len(df.time) - tlen)
     return loni, lati, ti
 
@@ -267,7 +269,7 @@ def PredLTC(predn, inputs, outputs, ncells=None, sparsity=0.5):
     lnn = LTC(inputs, wiring)
     return Predictor(lnn, torch.zeros(ncells), predn)
 
-def PredLSTM(predn, inputs, outputs, nlayers=1):
+def PredLSTM(predn, inputs, outputs, nlayers=1, sparsity=None):
     lstm = nn.LSTM(inputs, outputs, num_layers=nlayers)
     return Predictor(lstm, (torch.zeros((nlayers, outputs)), torch.zeros((nlayers, outputs))), predn)
 
@@ -278,7 +280,8 @@ class LiquidOperator(nn.Module):
         # 6. Fully connected preprocessing layer   => time x vars * level
         self.preproc = VarEncoder(VAR_N*LEVELS, VAR_N*LEVELS)
         # 7. LTC                                   => time x vars x level
-        self.ltcs = [PredLTC(predn=self.pred_n, inputs=LEVELS, outputs=LEVELS, sparsity=0.5) for _ in range(VAR_N)]
+        # FIXME: change predlstm
+        self.ltcs = [PredLSTM(predn=self.pred_n, inputs=LEVELS, outputs=LEVELS, sparsity=0.5) for _ in range(VAR_N)]
         # 8. Fully connected postprocessing layers => time x vars * level
         self.postproc = CrossConnector(LEVELS, VAR_N, VAR_N*LEVELS, VAR_N*LEVELS, tile_dim=1)
 
@@ -313,7 +316,7 @@ class WeatherPredictor(nn.Module):
         self.base_model = persistence_model
 
     def forward(self, x):
-        return self.lo(self.re(x)) + self.base_model(x)
+        return self.lo(self.re(x)) # + self.base_model(x)
 
 def anomaly_correlation(x, y, c):
     '''Calculate the anomaly correlation for a forecase.
