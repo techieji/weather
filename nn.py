@@ -279,9 +279,9 @@ class LiquidOperator(nn.Module):
 
         # 6. Fully connected preprocessing layer   => time x vars * level
         self.preproc = VarEncoder(VAR_N*LEVELS, VAR_N*LEVELS)
-        # 7. LTC                                   => time x vars x level
-        # FIXME: change predlstm
-        self.ltcs = [PredLSTM(predn=self.pred_n, inputs=LEVELS, outputs=LEVELS, sparsity=0.5) for _ in range(VAR_N)]
+        # 7. LTC => time x vars x level
+        self.lstm = PredLSTM(predn=self.pred_n, inputs=LEVELS*VAR_N, outputs=LEVELS*VAR_N)
+        self.ltcs = [PredLTC(predn=self.pred_n, inputs=LEVELS, outputs=LEVELS, sparsity=0.5) for _ in range(VAR_N)]
         # 8. Fully connected postprocessing layers => time x vars * level
         self.postproc = CrossConnector(LEVELS, VAR_N, VAR_N*LEVELS, VAR_N*LEVELS, tile_dim=1)
 
@@ -293,7 +293,8 @@ class LiquidOperator(nn.Module):
         # xs: vars x time x level
         xs = self.preproc(x).reshape((VAR_N, -1, LEVELS)).unbind()
         # vs: time x vars x level
-        vs = torch.concat([ltc(x) for ltc, x in zip(self.ltcs, xs)]).transpose(0, 1)
+        # vs = torch.concat([ltc(x) for ltc, x in zip(self.ltcs, xs)]).transpose(0, 1)
+        vs = self.lstm(x).reshape((-1, VAR_N, LEVELS))
         # r: time x vars x level
         return self.postproc(vs)
 
