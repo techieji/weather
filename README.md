@@ -1,5 +1,9 @@
 # Weather prediction model
 
+## Loss log spec
+
+It's a list containing lists. Each sublist is an epoch, and it follows the following order: validation loss, training loss (over 1), and the PCC.
+
 ## Setting up the development environment
 
 ### Docker
