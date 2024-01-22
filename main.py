@@ -27,7 +27,7 @@ def setup():
     optim = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optim)
 
-LR = 0.03    # LR: 0.001
+LR = 0.07    # LR: 0.03
 
 def calc_loss(sl=None, model=None, needs_grad=True, train_mode=True, n=1):
     if model is None: model = globals()['model']   # Bad code on my part
