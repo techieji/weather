@@ -18,14 +18,16 @@ validate = None
 
 loss = torch.nn.L1Loss()
 
-def setup():
+def setup(do_model=True, do_data=True):
     global model, validate, optim, scheduler
-    nn.load_all()
-    model = nn.WeatherPredictor()
-    validate = Validator()
+    if do_data:
+        nn.load_all()
+    if do_model:
+        model = nn.WeatherPredictor()
+        validate = Validator()
 
-    optim = torch.optim.Adam(model.parameters(), lr=LR)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optim)
+        optim = torch.optim.Adam(model.parameters(), lr=LR)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optim)
 
 LR = 0.07    # LR: 0.03
 
@@ -87,9 +89,21 @@ class Validator:
                 pcces.append(pcc)
             return sum(losses), sum(pcces)/len(pcces)
 
-def _main(epoch_count=50, stop_limit=5):
-    if not nn.is_data_loaded():
-        nn.load_all()
+def data_saver(n, folder=nn.DATAENTRY_FOLDER):
+    i = 1
+    c = 0
+    while c < n:
+        try:
+            with open(f'{folder}/dataentry-{i}.pt', 'xb') as f:
+                torch.save(nn.DataEntry.get_current_entry(nn.random_slice_slow()), f)
+        except FileExistsError:
+            i += 1
+        else:
+            print('Saved: ', i)
+            i += 1
+            c += 1
+
+def _main(epoch_count, stop_limit):
     last_val_loss = np.inf
     stop_n = 0
     for i in range(epoch_count):
@@ -125,8 +139,7 @@ def main(*args, **kwargs):
         lossl.append(loss)
         print(i, loss[0], base_loss - loss[0], loss[2], sep='\t')
     print('Final diff:', base_loss - loss[0])
-    # if base_loss - loss[0] > 0:
-    if True:
+    if base_loss - loss[0] > 0:
         print('success!')
         torch.save(model.state_dict(), f'model-last-{time()}.pt')
         with open(f'model-loss-last-{time()}.json', 'w') as f:
@@ -140,10 +153,14 @@ if __name__ == '__main__':
     parser.add_argument('-e', '--epoch-count', type=int, default=100)
     parser.add_argument('-s', '--stop-num', type=int, default=5)
     parser.add_argument('-t', '--test-forwards', action='store_true')
+    parser.add_argument('-d', '--data-cache', action='store_true')
+    parser.add_argument('-O', '--optimized', action='store_true')
     args = parser.parse_args()
     if args.file is not None:
         state_dict = torch.load(args.file)
         model.load_state_dict(state_dict)
+    if args.optimized:
+        nn.random_slice = nn.random_slice_fast
     if args.test_forwards:
         diam = 2*nn.GLOBAL_TILE - 1
         nn._const_sel = torch.zeros((diam, diam, nn.VAR_C))
@@ -152,6 +169,11 @@ if __name__ == '__main__':
         model = nn.WeatherPredictor()
         model(sl)
         print('Success!')
+    elif args.data_cache:
+        print('Starting data cache system')
+        setup(do_model=False)
+        data_saver(args.epoch_count)
+        print('Done!')
     else:
-        setup()
+        setup(do_data=not args.optimized)
         main(epoch_count=args.epoch_count, stop_limit=args.stop_num)

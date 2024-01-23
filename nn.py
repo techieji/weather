@@ -9,10 +9,14 @@ import numpy as np
 
 from dataclasses import dataclass
 import os.path
+from pathlib import Path
+from itertools import count
 
 rng = np.random.default_rng(seed=1)
 
 USE_ANOMALIES = True
+DATAENTRY_FOLDER = 'dataentries'
+Path(DATAENTRY_FOLDER).mkdir(parents=True, exist_ok=True)
 
 ONNX_EXPORT = False
 
@@ -32,7 +36,7 @@ LEVELS = 17
 CONSTANTS = 'orog lsm alb vegh vegl'.split()
 VAR_C = len(CONSTANTS)
 
-N_CONVS = 1
+N_CONVS = 2
 GLOBAL_TILE = 3  # Like a radius
 CONVOL_TILE = 3
 OUTPUT_TILE = 3
@@ -42,7 +46,7 @@ LTC_SPARSITY = 0.5
 
 PRED_N = 12
 
-act = nn.Sigmoid    # nn.SELU
+act = nn.Sigmoid
 
 fields = len(PRED_VARS) * LEVELS + len(CONSTANTS)
 
@@ -52,6 +56,7 @@ class PrognosticVars:
     pres: xr.Dataset
 
 def load_data(data_loc='~/data', force=False):
+    raise Exception('asdf')
     global DATA, RAW_DATA
     if DATA is None or force:
         RAW_DATA = PrognosticVars(
@@ -134,7 +139,9 @@ def sel_anom(loni, lati, ti, raise_errors=True):   # TODO: very similar to sel_c
             raise e
 
 def to_tensors(arr):    # time x vars x lon x lat x level
-    return torch.nan_to_num(torch.asarray(arr.to_numpy())).to(torch.float32)
+    if type(arr) is not torch.Tensor:
+        return torch.nan_to_num(torch.asarray(arr.to_numpy())).to(torch.float32)
+    return arr
 
 def random_pos(): # raw values: lon, lat, time
     posw = GLOBAL_TILE
@@ -147,7 +154,7 @@ def random_pos(): # raw values: lon, lat, time
     ti = rng.integers(0, len(df.time) - tlen)
     return loni, lati, ti
 
-def random_slice(raise_errors=True):
+def random_slice_slow(raise_errors=True):
     loni, lati, ti = random_pos()
     sel_const(loni, lati, raise_errors=raise_errors)
     if USE_ANOMALIES:
@@ -158,6 +165,37 @@ def random_slice(raise_errors=True):
     except Exception as e:
         if raise_errors:
             raise e
+@dataclass
+class DataEntry:
+    sel: torch.Tensor
+    const_sel: torch.Tensor
+    anom_sel: torch.Tensor
+
+    @staticmethod
+    def get_current_entry(xarr):
+        return DataEntry(to_tensors(xarr), _const_sel, _anom_sel)
+
+    def set_current_entry(self):
+        global _const_sel, _anom_sel
+        _const_sel = self.const_sel
+        _anom_sel = self.anom_sel
+        return self.sel
+
+def random_slice_iter(folder=DATAENTRY_FOLDER):
+    for i in count(1):
+        try:
+            with open(f'{folder}/dataentry-{i}.pt', 'rb') as f:
+                yield torch.load(f).set_current_entry()
+        except FileNotFoundError:
+            return
+        except EOFError:
+            print(f'{folder}/dataentry-{i}.pt is defective')
+            continue
+
+def random_slice_fast(it=random_slice_iter()):
+    return next(it)
+
+random_slice = random_slice_slow
 
 class VarEncoder(nn.Module):
     def __init__(self, inp, out):
@@ -295,15 +333,9 @@ class LiquidOperator(nn.Module):
         xs = self.preproc(x).reshape((VAR_N, -1, LEVELS)).unbind()
         # vs: time x vars x level
         # vs = torch.concat([ltc(x) for ltc, x in zip(self.ltcs, xs)]).transpose(0, 1)
-        vs = self.ltc(x).reshape((-1, VAR_N, LEVELS))
+        vs = self.lstm(x).reshape((-1, VAR_N, LEVELS))
         # r: time x vars x level
         return self.postproc(vs)
-
-class LSTMOperator(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.preproc = VarEncoder(VAR_N*LEVELS, VAR_N*LEVELS)
-        self.lstm = nn.LSTM(VAR_N*LEVELS, VAR_N*LEVELS)
 
 def persistence_model(x):
     # lt: var x level
