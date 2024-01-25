@@ -3,18 +3,16 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from time import time
-import json
 
 import sys
 import argparse
+from dataclasses import dataclass
+from collections import namedtuple
+import random
+import glob
 
 model = None
 validate = None
-
-# def loss(value, mvalue, anom):
-#     print('nans:', value.isnan().sum(), mvalue.isnan().sum(), anom.isnan().sum())
-#     pcc = nn.anomaly_correlation(value, mvalue, anom)
-#     return F.mse_loss(mvalue, value) * -pcc
 
 loss = torch.nn.L1Loss()
 
@@ -62,7 +60,7 @@ def train(n=1):
 
 class Validator:
     def __init__(self, n=10):
-        print('Setting up validator...')
+        print('=> Setting up validator...')
         self.n = n
         self.slices = []
         self._const_sels = []
@@ -103,6 +101,72 @@ def data_saver(n, folder=nn.DATAENTRY_FOLDER):
             i += 1
             c += 1
 
+EpochData = namedtuple('EpochData', 'train_loss val_loss pcc')
+
+def random_word():
+    vowels = 'aeiuo'
+    consonents = 'qwrtypsdfghjklzxcvbnm'
+    digraphs = 'sc ng ch ph sh it th wh ci qu'.split()
+    conson_like = list(consonents) + digraphs
+    l = 5
+    return ''.join(random.choice(conson_like if i % 2 == 0 else vowels) for i in range(l))
+
+@dataclass
+class ModelData:
+    epoch_num: int = 0
+    constructor: str = ''
+    big: bool = False
+    learning_rate: float = 0
+    base_data: EpochData = None
+    base_model: str = 'persistence'    # Probably going to be fixed
+    epoch_data: list[EpochData] = None
+    model: torch.nn.Module = None
+
+    def add_epoch_data(self, train_loss, val_loss, pcc):
+        if self.epoch_data is None:
+            self.epoch_data = []
+        self.epoch_data.append(EpochData(train_loss, val_loss, pcc))
+        self.epoch_num += 1
+
+    def set_base_data(self, loss, pcc):
+        self.base_data = EpochData(None, loss, pcc)
+
+    def get_var(self, var: str):
+        return [getattr(x, var) for x in self.epoch_data]
+
+    def save(self, folder='models'):
+        name = random_word() + '_' + random_word()
+        print(f'=> Saving model {name}')
+        torch.save(self, f'{folder}/model-{name}.pt')
+        return name
+
+    @staticmethod
+    def load(name, folder='models'):
+        return torch.load(f'{folder}/model-{name}.pt')
+
+    @staticmethod
+    def load_all(folder='models', raise_errors=True):
+        for file in glob.iglob(f'{folder}/model-*.pt'):
+            name = file.split('-')[-1][:-3]
+            try:
+                yield ModelData.load(name)
+            except:
+                if raise_errors:
+                    raise
+                print(f'{name} is defective... somehow')
+
+    @staticmethod
+    def get_representatives(folder='models', raise_errors=True):
+        # Mainly four categories: lstm-forked, lstm-big, ltc-forked, ltc-big
+        lstm_fork, lstm_big, ltc_fork, ltc_big = [], [], [], []
+        for model in ModelData.load_all(folder, raise_errors):
+            if model.constructor == 'lstm':
+                if model.big: lstm_big.append(model)
+                else: lstm_fork.append(model)
+            else:
+                if model.big: ltc_big.append(model)
+                else: ltc_fork.append(model)
+
 def _main(epoch_count, stop_limit):
     last_val_loss = np.inf
     stop_n = 0
@@ -125,40 +189,47 @@ def _main(epoch_count, stop_limit):
         except Exception as e:
             print(f'Error ({i}):', e)
 
-def main(*args, **kwargs):
-    print('Calculating base loss')
+def main(save, *args, **kwargs):
+    print('=> Setting up data storage system')
+    data = ModelData()
+    data.constructor = nn.CONSTRUCTOR
+    data.big = nn.BIG
+    data.learning_rate = LR
+    # TODO: set up constructor, big, learning rate
+    print('=> Calculating base loss')
     base_loss, base_pcc = validate(model=nn.persistence_model)
     base_loss = base_loss.item()
     base_pcc = base_pcc.item()
+    data.set_base_data(base_loss, base_pcc)
     print('Base loss:', base_loss)
     print('Base PCC :', base_pcc)
-    print('Epoch\tLoss\tDiff\tPCC')
-    print('-----\t----\t----\t---')
-    lossl = []
+    print('Epoch\t Loss \t\t Diff \t\t PCC ')
+    print('-----\t------\t\t------\t\t-----')
     for i, loss in enumerate(_main(*args, **kwargs)):
-        lossl.append(loss)
-        print(i, loss[0], base_loss - loss[0], loss[2], sep='\t')
+        # print(i, loss[0], base_loss - loss[0], loss[2], sep='\t')
+        print(f'{i}\t{loss[0]:.6f}\t{base_loss - loss[0]:.6f}\t{loss[2]:.6f}')
+        data.add_epoch_data(loss[1], loss[0], loss[2])
     print('Final diff:', base_loss - loss[0])
-    if base_loss - loss[0] > 0:
+    if (base_loss - loss[0] > 0) or save:
         print('success!')
-        torch.save(model.state_dict(), f'model-last-{time()}.pt')
-        with open(f'model-loss-last-{time()}.json', 'w') as f:
-            json.dump(lossl, f)
+        data.model = model
+        data.save()
     else:
         print('fail.')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='weather-trainer')
-    parser.add_argument('-f', '--file')
     parser.add_argument('-e', '--epoch-count', type=int, default=100)
     parser.add_argument('-s', '--stop-num', type=int, default=5)
     parser.add_argument('-t', '--test-forwards', action='store_true')
     parser.add_argument('-d', '--data-cache', action='store_true')
     parser.add_argument('-O', '--optimized', action='store_true')
+    parser.add_argument('-c', '--save', action='store_true')
+    parser.add_argument('-m', '--model-type', choices=['lstm', 'ltc'], default='ltc')
+    parser.add_argument('-b', '--big-model', action='store_true')
     args = parser.parse_args()
-    if args.file is not None:
-        state_dict = torch.load(args.file)
-        model.load_state_dict(state_dict)
+    nn.CONSTRUCTOR = args.model_type
+    nn.BIG = args.big_model
     if args.optimized:
         nn.random_slice = nn.random_slice_fast
     if args.test_forwards:
@@ -176,4 +247,4 @@ if __name__ == '__main__':
         print('Done!')
     else:
         setup(do_data=not args.optimized)
-        main(epoch_count=args.epoch_count, stop_limit=args.stop_num)
+        main(epoch_count=args.epoch_count, stop_limit=args.stop_num, save=args.save)

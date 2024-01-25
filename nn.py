@@ -14,6 +14,9 @@ from itertools import count
 
 rng = np.random.default_rng(seed=1)
 
+CONSTRUCTOR = 'ltc'
+BIG = False
+
 USE_ANOMALIES = True
 DATAENTRY_FOLDER = 'dataentries'
 Path(DATAENTRY_FOLDER).mkdir(parents=True, exist_ok=True)
@@ -311,16 +314,23 @@ def PredLSTM(predn, inputs, outputs, nlayers=1, sparsity=None):
     lstm = nn.LSTM(inputs, outputs, num_layers=nlayers)
     return Predictor(lstm, (torch.zeros((nlayers, outputs)), torch.zeros((nlayers, outputs))), predn)
 
+CONSTRUCTOR_MEANING = {
+    'lstm': PredLSTM,
+    'ltc': PredLTC
+}
+
 class LiquidOperator(nn.Module):
-    def __init__(self):
+    def __init__(self, constructor=PredLTC, big=False):
         super().__init__()
 
         # 6. Fully connected preprocessing layer   => time x vars * level
         self.preproc = VarEncoder(VAR_N*LEVELS, VAR_N*LEVELS)
         # 7. LTC => time x vars x level
-        self.lstm = PredLSTM(predn=self.pred_n, inputs=LEVELS*VAR_N, outputs=LEVELS*VAR_N)
-        self.ltc = PredLTC(predn=self.pred_n, inputs=LEVELS*VAR_N, outputs=LEVELS*VAR_N, sparsity=0.5)
-        self.ltcs = [PredLTC(predn=self.pred_n, inputs=LEVELS, outputs=LEVELS, sparsity=0.5) for _ in range(VAR_N)]
+        self.big = big
+        if self.big:
+            self.ltc = constructor(predn=self.pred_n, inputs=LEVELS*VAR_N, outputs=LEVELS*VAR_N, sparsity=0.5)
+        else:
+            self.ltcs = [constructor(predn=self.pred_n, inputs=LEVELS, outputs=LEVELS, sparsity=0.5) for _ in range(VAR_N)]
         # 8. Fully connected postprocessing layers => time x vars * level
         self.postproc = CrossConnector(LEVELS, VAR_N, VAR_N*LEVELS, VAR_N*LEVELS, tile_dim=1)
 
@@ -332,8 +342,10 @@ class LiquidOperator(nn.Module):
         # xs: vars x time x level
         xs = self.preproc(x).reshape((VAR_N, -1, LEVELS)).unbind()
         # vs: time x vars x level
-        # vs = torch.concat([ltc(x) for ltc, x in zip(self.ltcs, xs)]).transpose(0, 1)
-        vs = self.lstm(x).reshape((-1, VAR_N, LEVELS))
+        if self.big:
+            vs = self.ltc(x).reshape((-1, VAR_N, LEVELS))
+        else:
+            vs = torch.concat([ltc(x) for ltc, x in zip(self.ltcs, xs)]).transpose(0, 1)
         # r: time x vars x level
         return self.postproc(vs)
 
@@ -343,14 +355,16 @@ def persistence_model(x):
     return lt.flatten(1).repeat(TIME_LENGTH + PRED_N, 1, 1).flatten(1)
 
 class WeatherPredictor(nn.Module):
-    def __init__(self):
+    def __init__(self, base_model=None):
         super().__init__()
         self.re = RegionEncoder()
-        self.lo = LiquidOperator()
-        self.base_model = persistence_model
+        self.lo = LiquidOperator(CONSTRUCTOR_MEANING[CONSTRUCTOR], BIG)
+        self.base_model = base_model
 
     def forward(self, x):
-        return self.lo(self.re(x)) # + self.base_model(x)
+        if self.base_model is not None:
+            return self.lo(self.re(x)) + self.base_model(x)
+        return self.lo(self.re(x))
 
 def anomaly_correlation(x, y, c):
     '''Calculate the anomaly correlation for a forecase.
