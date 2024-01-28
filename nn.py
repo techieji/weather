@@ -45,11 +45,11 @@ CONVOL_TILE = 3
 OUTPUT_TILE = 3
 TIME_LENGTH = 10
 
-LTC_SPARSITY = 0.5
+LTC_SPARSITY = 0.6
 
 PRED_N = 12
 
-act = nn.Sigmoid
+act = nn.ReLU
 
 fields = len(PRED_VARS) * LEVELS + len(CONSTANTS)
 
@@ -168,6 +168,14 @@ def random_slice_slow(raise_errors=True):
     except Exception as e:
         if raise_errors:
             raise e
+
+def forward_fill_nan(arr, dim=0, nan=0.0):
+    # arr: time x n_var x level
+    i, s = zip(*enumerate(arr.shape))
+    idx = torch.arange(s[dim]).repeat(*s[:dim], *s[dim+1:], 1).permute((i[-1], *i[:-1]))
+    idx[arr.isnan()] = 0
+    return torch.gather(arr, dim, idx.cummax(dim).values)
+
 @dataclass
 class DataEntry:
     sel: torch.Tensor
@@ -180,15 +188,19 @@ class DataEntry:
 
     def set_current_entry(self):
         global _const_sel, _anom_sel
-        _const_sel = self.const_sel
-        _anom_sel = self.anom_sel
-        return self.sel
+        _const_sel = self.const_sel.to(torch.float32)
+        _anom_sel = self.anom_sel.to(torch.float32)
+        v = _anom_sel[:,:,1]    # v-wind, I think
+        v[v.isnan()] = 0
+        return self.sel.to(torch.float32)
 
-def random_slice_iter(folder=DATAENTRY_FOLDER):
+def random_slice_iter(folder=DATAENTRY_FOLDER, n=1):
     for i in count(1):
         try:
             with open(f'{folder}/dataentry-{i}.pt', 'rb') as f:
-                yield torch.load(f).set_current_entry()
+                r = torch.load(f).set_current_entry()
+                for _ in range(n):
+                    yield r
         except FileNotFoundError:
             return
         except EOFError:
@@ -298,7 +310,8 @@ class Predictor(nn.Module):
             l.append(v)
         # Run the prediction using previous predictions
         for _ in range(self.predn):
-            v, self.state = self.model(v)
+            v, self.state = self.model(v, self.state)
+            # v, self.state = self.model(torch.zeros_like(v), self.state)
             l.append(v)
         return torch.stack(l, dim=self.dim)
 
@@ -306,11 +319,11 @@ def PredLTC(predn, inputs, outputs, ncells=None, sparsity=0.5):
     if ncells is None:
         ncells = int(outputs//0.3)
 
-    wiring = AutoNCP(ncells, outputs, sparsity_level=sparsity)
+    wiring = AutoNCP(ncells, outputs, sparsity_level=LTC_SPARSITY)
     lnn = LTC(inputs, wiring)
     return Predictor(lnn, torch.zeros(ncells), predn)
 
-def PredLSTM(predn, inputs, outputs, nlayers=1, sparsity=None):
+def PredLSTM(predn, inputs, outputs, nlayers=2, sparsity=None):
     lstm = nn.LSTM(inputs, outputs, num_layers=nlayers)
     return Predictor(lstm, (torch.zeros((nlayers, outputs)), torch.zeros((nlayers, outputs))), predn)
 
@@ -352,19 +365,36 @@ class LiquidOperator(nn.Module):
 def persistence_model(x):
     # lt: var x level
     lt = x[-1,:,GLOBAL_TILE,GLOBAL_TILE,:]
-    return lt.flatten(1).repeat(TIME_LENGTH + PRED_N, 1, 1).flatten(1)
+    return lt.flatten(1).repeat(TIME_LENGTH + PRED_N, 1, 1)
 
 class WeatherPredictor(nn.Module):
-    def __init__(self, base_model=None):
+    def __init__(self):
         super().__init__()
         self.re = RegionEncoder()
         self.lo = LiquidOperator(CONSTRUCTOR_MEANING[CONSTRUCTOR], BIG)
-        self.base_model = base_model
+        gain = torch.nn.init.calculate_gain('relu')
+        def set_weights(m):
+            try:
+                torch.nn.init.xavier_uniform_(m.weight, gain=2*gain)
+            except AttributeError:
+                pass
+        self.apply(set_weights)
 
-    def forward(self, x):
-        if self.base_model is not None:
-            return self.lo(self.re(x)) + self.base_model(x)
-        return self.lo(self.re(x))
+    def forward(self, _x):
+        x = _x
+        #x = _x - _x[-1].unsqueeze(0).repeat(_x.shape[0], 1, 1, 1, 1)
+        res = self.lo(self.re(x)).reshape((-1, VAR_N, LEVELS))# + _x[-1,:,GLOBAL_TILE,GLOBAL_TILE,:].unsqueeze(0).repeat(TIME_LENGTH + PRED_N, 1, 1)
+        return res
+        # return self.lo(self.re(x))
+
+    '''
+    def forward(self, _x):
+        side_len = 2*GLOBAL_TILE - 1
+        x = _x - _anom_sel[:TIME_LENGTH].transpose(1, 2).unsqueeze(2).unsqueeze(2).repeat(1, 1, side_len, side_len, 1)
+        res = self.lo(self.re(x)).reshape((-1, LEVELS, VAR_N)) + _anom_sel
+        return res.transpose(1, 2)
+        # return self.lo(self.re(x))
+    '''
 
 def anomaly_correlation(x, y, c):
     '''Calculate the anomaly correlation for a forecase.

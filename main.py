@@ -29,7 +29,7 @@ def setup(do_model=True, do_data=True):
 
 LR = 0.07    # LR: 0.03
 
-def calc_loss(sl=None, model=None, needs_grad=True, train_mode=True, n=1):
+def calc_loss(sl=None, model=None, needs_grad=True, train_mode=True, n=1, ret_v=False):
     if model is None: model = globals()['model']   # Bad code on my part
     try:
         model.train(train_mode)
@@ -44,11 +44,15 @@ def calc_loss(sl=None, model=None, needs_grad=True, train_mode=True, n=1):
         warmup = sl[:nn.TIME_LENGTH]
         warmup.requires_grad_(needs_grad)
         r = model(warmup)
-        value = sl[nn.TIME_LENGTH:,:,nn.GLOBAL_TILE,nn.GLOBAL_TILE,:].flatten(1)
+        value = sl[nn.TIME_LENGTH:,:,nn.GLOBAL_TILE,nn.GLOBAL_TILE,:]
         rvalue = r[nn.TIME_LENGTH:]
-        anom = nn._anom_sel.flatten(1)[nn.TIME_LENGTH:]
-        ret += loss(value, rvalue)
+        anom = nn._anom_sel[nn.TIME_LENGTH:].transpose(1, 2)
+        c = torch.sum(torch.isnan(anom))
+        l = loss(value, rvalue)
+        ret += l
         pcc += nn.anomaly_correlation(value, rvalue, anom)
+    if ret_v:
+        return ret/n, pcc/n, r.detach()
     return ret/n, pcc/n
 
 def train(n=1):
@@ -76,15 +80,21 @@ class Validator:
         nn._anom_sel = self._anom_sels[n]
         return self.slices[n]
 
-    def __call__(self, model=model):
+    def __call__(self, model=model, ret_var=False):
         with torch.no_grad():
             losses = []
             pcces = []
+            if ret_var: r = []
             for i in range(self.n):
                 sl = self._switch_to(i)
-                l, pcc = calc_loss(sl, model, False, False)
+                l, pcc, *v = calc_loss(sl, model, False, False, ret_v=ret_var)
                 losses.append(l)
                 pcces.append(pcc)
+                if ret_var:
+                    r.append(v[0])
+            if ret_var:
+                var = torch.stack(r).var(dim=0).norm()
+                return sum(losses), sum(pcces)/len(pcces), var
             return sum(losses), sum(pcces)/len(pcces)
 
 def data_saver(n, folder=nn.DATAENTRY_FOLDER):
@@ -101,7 +111,15 @@ def data_saver(n, folder=nn.DATAENTRY_FOLDER):
             i += 1
             c += 1
 
-EpochData = namedtuple('EpochData', 'train_loss val_loss pcc')
+EpochData = namedtuple('EpochData', 'train_loss val_loss pcc time variance')
+
+#@dataclass
+#class EpochData:
+#    train_loss: float = None
+#    val_loss: float = None
+#    pcc: float = None
+#    time: float = None
+#    variance: float = None
 
 def random_word():
     vowels = 'aeiuo'
@@ -117,22 +135,36 @@ class ModelData:
     constructor: str = ''
     big: bool = False
     learning_rate: float = 0
+    sparsity: float = 0
     base_data: EpochData = None
-    base_model: str = 'persistence'    # Probably going to be fixed
+    base_model: str = 'persistence'    # Probably a constant value
     epoch_data: list[EpochData] = None
     model: torch.nn.Module = None
+    start_time: float = 0
 
-    def add_epoch_data(self, train_loss, val_loss, pcc):
+    def start_collection(self):
+        self.start_time = time()
+
+    def add_epoch_data(self, train_loss, val_loss, pcc, var):
         if self.epoch_data is None:
             self.epoch_data = []
-        self.epoch_data.append(EpochData(train_loss, val_loss, pcc))
+        self.epoch_data.append(EpochData(train_loss, val_loss, pcc, time() - self.start_time, var))
         self.epoch_num += 1
 
     def set_base_data(self, loss, pcc):
-        self.base_data = EpochData(None, loss, pcc)
+        self.base_data = EpochData(None, loss, pcc, 0, 0)
 
     def get_var(self, var: str):
         return [getattr(x, var) for x in self.epoch_data]
+
+    def autoname(self, detail=False):
+        word = 'big' if self.big else 'forked'
+        if detail:
+            if self.constructor == 'lstm':
+                return f'{self.constructor}-{word} (lr={self.learning_rate})'
+            else:
+                return f'{self.constructor}-{word} (lr={self.learning_rate}, sp={self.sparsity})'
+        return f'{self.constructor}-{word}'
 
     def save(self, folder='models'):
         name = random_word() + '_' + random_word()
@@ -166,6 +198,10 @@ class ModelData:
             else:
                 if model.big: ltc_big.append(model)
                 else: ltc_fork.append(model)
+        for attr in 'epoch_num learning_rate base_model'.split():  # Sanity check
+            for l in [lstm_fork, lstm_big, ltc_fork, ltc_big]:
+                assert all(getattr(x, attr) == getattr(l[0], attr) for x in l)
+        # TODO: Finish
 
 def _main(epoch_count, stop_limit):
     last_val_loss = np.inf
@@ -175,12 +211,12 @@ def _main(epoch_count, stop_limit):
             print('Training stopped')
             break
         try:
-            val_loss, val_pcc = validate()
+            val_loss, val_pcc, val_var = validate(ret_var=True)
             val_loss = val_loss.sum()
             val_pcc = val_pcc.sum()
             train_loss, train_pcc = train(n=1)
-            yield (val_loss.item(), train_loss, val_pcc.item())
-            if val_loss - last_val_loss > 0:
+            yield (val_loss.item(), train_loss, val_pcc.item(), val_var.item())
+            if val_loss - last_val_loss >= 0:
                 stop_n += 1
             else:
                 stop_n = 0
@@ -195,6 +231,7 @@ def main(save, *args, **kwargs):
     data.constructor = nn.CONSTRUCTOR
     data.big = nn.BIG
     data.learning_rate = LR
+    data.sparsity = nn.LTC_SPARSITY
     # TODO: set up constructor, big, learning rate
     print('=> Calculating base loss')
     base_loss, base_pcc = validate(model=nn.persistence_model)
@@ -203,12 +240,13 @@ def main(save, *args, **kwargs):
     data.set_base_data(base_loss, base_pcc)
     print('Base loss:', base_loss)
     print('Base PCC :', base_pcc)
-    print('Epoch\t Loss \t\t Diff \t\t PCC ')
-    print('-----\t------\t\t------\t\t-----')
+    print('Epoch\t Loss \t\t Diff \t\t PCC \t\t Var ')
+    print('-----\t------\t\t------\t\t-----\t\t-----')
+    data.start_collection()
     for i, loss in enumerate(_main(*args, **kwargs)):
         # print(i, loss[0], base_loss - loss[0], loss[2], sep='\t')
-        print(f'{i}\t{loss[0]:.6f}\t{base_loss - loss[0]:.6f}\t{loss[2]:.6f}')
-        data.add_epoch_data(loss[1], loss[0], loss[2])
+        print(f'{i}\t{loss[0]:.6f}\t{base_loss - loss[0]:.6f}\t{loss[2]:.6f}\t{loss[3]:.6f}')
+        data.add_epoch_data(loss[1], loss[0], loss[2], loss[3])
     print('Final diff:', base_loss - loss[0])
     if (base_loss - loss[0] > 0) or save:
         print('success!')
@@ -227,18 +265,20 @@ if __name__ == '__main__':
     parser.add_argument('-c', '--save', action='store_true')
     parser.add_argument('-m', '--model-type', choices=['lstm', 'ltc'], default='ltc')
     parser.add_argument('-b', '--big-model', action='store_true')
+    parser.add_argument('-l', '--lr', type=float, default=LR)
+    parser.add_argument('-p', '--sparsity', type=float, default=nn.LTC_SPARSITY)
     args = parser.parse_args()
     nn.CONSTRUCTOR = args.model_type
     nn.BIG = args.big_model
+    LR = args.lr
+    nn.LTC_SPARSITY = args.sparsity
     if args.optimized:
         nn.random_slice = nn.random_slice_fast
     if args.test_forwards:
-        diam = 2*nn.GLOBAL_TILE - 1
-        nn._const_sel = torch.zeros((diam, diam, nn.VAR_C))
-        sl = torch.zeros((nn.TIME_LENGTH, nn.VAR_N, diam, diam, nn.LEVELS))
+        sl = nn.random_slice_fast()
         print('Starting test')
         model = nn.WeatherPredictor()
-        model(sl)
+        print(calc_loss(sl, needs_grad=False, train_mode=False))
         print('Success!')
     elif args.data_cache:
         print('Starting data cache system')
