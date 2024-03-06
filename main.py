@@ -29,6 +29,12 @@ def setup(do_model=True, do_data=True):
 
 LR = 0.07    # LR: 0.03
 
+def normalize(x):
+    side_len = 2*nn.GLOBAL_TILE - 1
+    interm = x - nn._anom_sel.transpose(1, 2).unsqueeze(2).unsqueeze(2).repeat(1, 1, side_len, side_len, 1)
+    std = torch.std(interm.swapaxes(0, 1).reshape((4, -1)), dim=1).unsqueeze(0).repeat(nn.TIME_LENGTH + nn.PRED_N, 1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+    return interm / std
+
 def calc_loss(sl=None, model=None, needs_grad=True, train_mode=True, n=1, ret_v=False):
     if model is None: model = globals()['model']   # Bad code on my part
     try:
@@ -41,6 +47,7 @@ def calc_loss(sl=None, model=None, needs_grad=True, train_mode=True, n=1, ret_v=
         if sl is None:
             _sl = nn.random_slice()
             sl = nn.to_tensors(_sl)
+        sl = normalize(sl)
         warmup = sl[:nn.TIME_LENGTH]
         warmup.requires_grad_(needs_grad)
         r = model(warmup)
@@ -224,6 +231,7 @@ def _main(epoch_count, stop_limit):
             scheduler.step(val_loss)
         except Exception as e:
             print(f'Error ({i}):', e)
+            raise e
 
 def main(save, *args, **kwargs):
     print('=> Setting up data storage system')
