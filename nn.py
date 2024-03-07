@@ -12,6 +12,8 @@ import os.path
 from pathlib import Path
 from itertools import count
 
+print = print
+
 rng = np.random.default_rng(seed=1)
 
 CONSTRUCTOR = 'ltc'
@@ -40,7 +42,7 @@ CONSTANTS = 'orog lsm alb vegh vegl'.split()
 VAR_C = len(CONSTANTS)
 
 N_CONVS = 2
-GLOBAL_TILE = 3  # Like a radius
+GLOBAL_TILE = 6  # Like a radius
 CONVOL_TILE = 3
 OUTPUT_TILE = 3
 TIME_LENGTH = 10
@@ -59,7 +61,6 @@ class PrognosticVars:
     pres: xr.Dataset
 
 def load_data(data_loc='~/data', force=False):
-    raise Exception('asdf')
     global DATA, RAW_DATA
     if DATA is None or force:
         RAW_DATA = PrognosticVars(
@@ -71,17 +72,18 @@ def load_data(data_loc='~/data', force=False):
             ], combine_attrs='drop_conflicts'),
             pres=xr.open_mfdataset(os.path.join(data_loc, 'pres.sfc.*.nc')),
         )
-        DATA = PrognosticVars(
-            vars=RAW_DATA.vars.interp(lon=CONST_TABLE.lon, lat=CONST_TABLE.lat),
-            pres=RAW_DATA.pres.interp(lon=CONST_TABLE.lon, lat=CONST_TABLE.lat)
-        )   # TODO find new boundary conditions or upsample CONST_TABLE
+        DATA = RAW_DATA
+        # DATA = PrognosticVars(
+        #     vars=RAW_DATA.vars.interp(lon=CONST_TABLE.lon, lat=CONST_TABLE.lat),
+        #     pres=RAW_DATA.pres.interp(lon=CONST_TABLE.lon, lat=CONST_TABLE.lat)
+        # )   # TODO find new boundary conditions or upsample CONST_TABLE
     return DATA
 
 def load_const_table(location='/pySPEEDY/pyspeedy/data/example_bc.nc', force=False):
     global CONST_TABLE
     if CONST_TABLE is None or force:
         data = xr.load_dataset(location)
-        CONST_TABLE = data[CONSTANTS]
+        CONST_TABLE = data[CONSTANTS].interp(lon=DATA.vars.lon, lat=DATA.vars.lat, method='cubic', kwargs={'fill_value': 'extrapolate'})
     return CONST_TABLE
 
 def load_clim_avg(location='~/data/clim_avg.nc'):
@@ -92,14 +94,14 @@ def load_clim_avg(location='~/data/clim_avg.nc'):
         idf = DATA.vars.isel(time=slice(i*slicen, (i+1)*slicen))
         idf['time'] = CLIM_AVG.time
         CLIM_AVG += idf
-    CLIM_AVG = CLIM_AVG.interpolate_na(method='linear', fill_value='extrapolate')
+    CLIM_AVG = CLIM_AVG.interpolate_na(method='cubic', fill_value='extrapolate')
     return CLIM_AVG
 
 def load_all():
-    load_const_table()
-    print("Constants loaded")
     load_data()
     print("Data loaded")
+    load_const_table()
+    print("Constants loaded")
     if USE_ANOMALIES:
         load_clim_avg()
         print("Climatological average loaded")
@@ -124,7 +126,7 @@ def sel_const(loni, lati, raise_errors=True):
     global const_sel, _const_sel
     try:
         const_sel = slice_pos(CONST_TABLE, loni, lati).to_dataarray().transpose()
-        _const_sel = torch.asarray(const_sel.to_numpy())
+        _const_sel = torch.asarray(const_sel.to_numpy()).to(torch.float32)
         return const_sel
     except Exception as e:
         if raise_errors:
@@ -134,7 +136,7 @@ def sel_anom(loni, lati, ti, raise_errors=True):   # TODO: very similar to sel_c
     global anom_sel, _anom_sel
     try:
         # anom_sel (1D): level
-        anom_sel = slice_time(CLIM_AVG, ti).isel(lon=loni, lat=lati).to_dataarray().transpose('time', 'level', 'variable')
+        anom_sel = slice_time(CLIM_AVG, ti).isel(lon=loni, lat=lati).to_dataarray().transpose('time', 'level', 'variable').fillna(0)
         _anom_sel = torch.asarray(anom_sel.to_numpy())
         return anom_sel
     except Exception as e:

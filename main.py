@@ -1,4 +1,16 @@
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
+
+progress = Progress(
+        SpinnerColumn(),
+        *Progress.get_default_columns(),
+        TimeElapsedColumn()
+)
+setupid = None
+doid = None
+
 import nn
+nn.print = progress.console.log
+print = progress.console.log
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -14,18 +26,27 @@ import glob
 model = None
 validate = None
 
+VALIDATE_N = 10
+
 loss = torch.nn.L1Loss()
 
 def setup(do_model=True, do_data=True):
     global model, validate, optim, scheduler
+    progress.start_task(setupid)
     if do_data:
         nn.load_all()
+    progress.update(setupid, advance=1)
     if do_model:
         model = nn.WeatherPredictor()
+        progress.update(setupid, advance=1)
         validate = Validator()
 
         optim = torch.optim.Adam(model.parameters(), lr=LR)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optim)
+    else:
+        progress.update(setupid, advance=1)
+        for _ in range(VALIDATE_N): progress.update(setupid, advance=1)
+    # progress.stop_task(setupid)
 
 LR = 0.07    # LR: 0.03
 
@@ -70,8 +91,8 @@ def train(n=1):
     return l.sum().item(), pcc.sum().item()
 
 class Validator:
-    def __init__(self, n=10):
-        print('=> Setting up validator...')
+    def __init__(self, n=VALIDATE_N):
+        progress.console.log('Setting up validator...')
         self.n = n
         self.slices = []
         self._const_sels = []
@@ -80,7 +101,8 @@ class Validator:
             self.slices.append(nn.to_tensors(nn.random_slice()))
             self._const_sels.append(nn._const_sel)
             self._anom_sels.append(nn._anom_sel)
-        print('Validator is set up')
+            progress.update(setupid, advance=1)
+        progress.console.log('Validator is set up')
 
     def _switch_to(self, n):
         nn._const_sel = self._const_sels[n]
@@ -107,6 +129,7 @@ class Validator:
 def data_saver(n, folder=nn.DATAENTRY_FOLDER):
     i = 1
     c = 0
+    progress.start_task(doid)
     while c < n:
         try:
             with open(f'{folder}/dataentry-{i}.pt', 'xb') as f:
@@ -117,16 +140,9 @@ def data_saver(n, folder=nn.DATAENTRY_FOLDER):
             print('Saved: ', i)
             i += 1
             c += 1
+            progress.update(doid, advance=1)
 
 EpochData = namedtuple('EpochData', 'train_loss val_loss pcc time variance')
-
-#@dataclass
-#class EpochData:
-#    train_loss: float = None
-#    val_loss: float = None
-#    pcc: float = None
-#    time: float = None
-#    variance: float = None
 
 def random_word():
     vowels = 'aeiuo'
@@ -213,6 +229,7 @@ class ModelData:
 def _main(epoch_count, stop_limit):
     last_val_loss = np.inf
     stop_n = 0
+    progress.start_task(doid)
     for i in range(epoch_count):
         if stop_n > stop_limit:
             print('Training stopped')
@@ -229,9 +246,11 @@ def _main(epoch_count, stop_limit):
                 stop_n = 0
             last_val_loss = val_loss
             scheduler.step(val_loss)
+            progress.update(doid, advance=1)
         except Exception as e:
             print(f'Error ({i}):', e)
             raise e
+    # progress.stop_task(doid)
 
 def main(save, *args, **kwargs):
     print('=> Setting up data storage system')
@@ -280,6 +299,7 @@ if __name__ == '__main__':
     nn.BIG = args.big_model
     LR = args.lr
     nn.LTC_SPARSITY = args.sparsity
+
     if args.optimized:
         nn.random_slice = nn.random_slice_fast
     if args.test_forwards:
@@ -289,10 +309,18 @@ if __name__ == '__main__':
         print(calc_loss(sl, needs_grad=False, train_mode=False))
         print('Success!')
     elif args.data_cache:
+        setupid = progress.add_task('Setting up', total=VALIDATE_N + 2, start=False)
+        doid = progress.add_task('Saving data', total=args.epoch_count, start=False)
+        progress.start()
         print('Starting data cache system')
         setup(do_model=False)
         data_saver(args.epoch_count)
         print('Done!')
     else:
+        setupid = progress.add_task('Setting up', total=VALIDATE_N + 2, start=False)
+        doid = progress.add_task('Training', total=args.epoch_count, start=False)
+        progress.start()
+
         setup(do_data=not args.optimized)
         main(epoch_count=args.epoch_count, stop_limit=args.stop_num, save=args.save)
+        progress.stop()
