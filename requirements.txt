@@ -11,3 +11,4 @@ torch
 ncps
 jupyterplot
 scipy
+rich

@@ -51,7 +51,7 @@ LTC_SPARSITY = 0.6
 
 PRED_N = 12
 
-act = nn.ReLU
+act = lambda: nn.LeakyReLU()
 
 fields = len(PRED_VARS) * LEVELS + len(CONSTANTS)
 
@@ -73,10 +73,6 @@ def load_data(data_loc='~/data', force=False):
             pres=xr.open_mfdataset(os.path.join(data_loc, 'pres.sfc.*.nc')),
         )
         DATA = RAW_DATA
-        # DATA = PrognosticVars(
-        #     vars=RAW_DATA.vars.interp(lon=CONST_TABLE.lon, lat=CONST_TABLE.lat),
-        #     pres=RAW_DATA.pres.interp(lon=CONST_TABLE.lon, lat=CONST_TABLE.lat)
-        # )   # TODO find new boundary conditions or upsample CONST_TABLE
     return DATA
 
 def load_const_table(location='/pySPEEDY/pyspeedy/data/example_bc.nc', force=False):
@@ -88,13 +84,17 @@ def load_const_table(location='/pySPEEDY/pyspeedy/data/example_bc.nc', force=Fal
 
 def load_clim_avg(location='~/data/clim_avg.nc'):
     global CLIM_AVG
-    slicen = 1461
-    CLIM_AVG = DATA.vars.isel(time=slice(0, 1461))
-    for i in range(len(DATA.vars.time)//slicen):
-        idf = DATA.vars.isel(time=slice(i*slicen, (i+1)*slicen))
-        idf['time'] = CLIM_AVG.time
+    CLIM_AVG = DATA.vars.sel(time=DATA.vars.time.dt.year == 1999)
+    for i in range(2):
+        idf = DATA.vars.sel(time=DATA.vars.time.dt.year == 2000 + i)
+        idf['time'] = idf.time - np.timedelta64(365*(i + 1), 'D')
         CLIM_AVG += idf
-    CLIM_AVG = CLIM_AVG.interpolate_na(method='cubic', fill_value='extrapolate')
+    CLIM_AVG /= 3
+    CLIM_AVG = (CLIM_AVG
+                .rolling(time=14, center=True, min_periods=1).mean()
+                .rolling(lon=10, center=True, min_periods=1).mean()
+                .rolling(lat=10, center=True, min_periods=1).mean())
+    # CLIM_AVG = CLIM_AVG.rolling(time=14, center=True, min_periods=1).mean()
     return CLIM_AVG
 
 def load_all():
@@ -277,18 +277,19 @@ class RegionEncoder(nn.Module):   # TODO: optimize for functional programming
         # TODO: allow batch to be optional
         # (pos) = lon x lat x level
         # x: batch x vars x (pos)
-        x = self.dropout(x)
         # vs: batch x (pos) x vars
         vs = torch.stack(
             [enc(torch.cat((
                 var, _const_sel.unsqueeze(0).repeat(*var.shape[:-3], *[1]* 3)   # 3 is num of dims of _const_sel  FIXME check if this works
             ), dim=-1)) for var, enc in zip(x.unbind(1), self.encs)]
         ).transpose(0, 1).movedim((-1, -2, -3), (-2, -3, -4))
+        vs = self.dropout(vs)
         # pvs: batch x pvars x (pos)
         pvs = torch.movedim(self.mixer(vs), (-2, -3, -4), (-1, -2, -3))
         for conv in self.convs:
             pvs = conv(pvs)
         pvs = self.pool(pvs)
+        pvs = self.dropout(pvs)
         # returns (1D): batch x level * vars
         return self.layer(pvs)
 

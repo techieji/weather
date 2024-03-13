@@ -1,16 +1,12 @@
 from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
+from rich.traceback import install
+from rich.prompt import Confirm
 
-progress = Progress(
-        SpinnerColumn(),
-        *Progress.get_default_columns(),
-        TimeElapsedColumn()
-)
+progress = None
 setupid = None
 doid = None
 
 import nn
-nn.print = progress.console.log
-print = progress.console.log
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -26,7 +22,7 @@ import glob
 model = None
 validate = None
 
-VALIDATE_N = 10
+VALIDATE_N = 30
 
 loss = torch.nn.L1Loss()
 
@@ -50,10 +46,14 @@ def setup(do_model=True, do_data=True):
 
 LR = 0.07    # LR: 0.03
 
+denorm_data = None
+
 def normalize(x):
+    global denorm_data
     side_len = 2*nn.GLOBAL_TILE - 1
     interm = x - nn._anom_sel.transpose(1, 2).unsqueeze(2).unsqueeze(2).repeat(1, 1, side_len, side_len, 1)
     std = torch.std(interm.swapaxes(0, 1).reshape((4, -1)), dim=1).unsqueeze(0).repeat(nn.TIME_LENGTH + nn.PRED_N, 1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+    denorm_data = std, nn._anom_sel
     return interm / std
 
 def calc_loss(sl=None, model=None, needs_grad=True, train_mode=True, n=1, ret_v=False):
@@ -247,12 +247,15 @@ def _main(epoch_count, stop_limit):
             last_val_loss = val_loss
             scheduler.step(val_loss)
             progress.update(doid, advance=1)
+        except KeyboardInterrupt:
+            print('Exiting')
+            exit()
         except Exception as e:
             print(f'Error ({i}):', e)
             raise e
     # progress.stop_task(doid)
 
-def main(save, *args, **kwargs):
+def main(save, prompt, *args, **kwargs):
     print('=> Setting up data storage system')
     data = ModelData()
     data.constructor = nn.CONSTRUCTOR
@@ -272,9 +275,12 @@ def main(save, *args, **kwargs):
     data.start_collection()
     for i, loss in enumerate(_main(*args, **kwargs)):
         # print(i, loss[0], base_loss - loss[0], loss[2], sep='\t')
-        print(f'{i}\t{loss[0]:.6f}\t{base_loss - loss[0]:.6f}\t{loss[2]:.6f}\t{loss[3]:.6f}')
+        print(f'{i+1}\t{loss[0]:.6f}\t{base_loss - loss[0]:.6f}\t{loss[2]:.6f}\t{loss[3]:.6e}')
         data.add_epoch_data(loss[1], loss[0], loss[2], loss[3])
     print('Final diff:', base_loss - loss[0])
+    progress.stop()
+    if prompt:
+        save = Confirm.ask("Save model?")
     if (base_loss - loss[0] > 0) or save:
         print('success!')
         data.model = model
@@ -290,6 +296,7 @@ if __name__ == '__main__':
     parser.add_argument('-d', '--data-cache', action='store_true')
     parser.add_argument('-O', '--optimized', action='store_true')
     parser.add_argument('-c', '--save', action='store_true')
+    parser.add_argument('-a', '--prompt', action='store_true', default=True)
     parser.add_argument('-m', '--model-type', choices=['lstm', 'ltc'], default='ltc')
     parser.add_argument('-b', '--big-model', action='store_true')
     parser.add_argument('-l', '--lr', type=float, default=LR)
@@ -299,28 +306,31 @@ if __name__ == '__main__':
     nn.BIG = args.big_model
     LR = args.lr
     nn.LTC_SPARSITY = args.sparsity
+    install()
+    with Progress(SpinnerColumn(), *Progress.get_default_columns(), TimeElapsedColumn()) as _progress:
+        progress = _progress
+        nn.print = progress.console.log
+        print = progress.console.log
+        if args.optimized:
+            nn.random_slice = nn.random_slice_fast
+        if args.test_forwards:
+            sl = nn.random_slice_fast()
+            print('Starting test')
+            model = nn.WeatherPredictor()
+            print(calc_loss(sl, needs_grad=False, train_mode=False))
+            print('Success!')
+        elif args.data_cache:
+            setupid = progress.add_task('Setting up', total=VALIDATE_N + 2, start=False)
+            doid = progress.add_task('Saving data', total=args.epoch_count, start=False)
+            progress.start()
+            print('Starting data cache system')
+            setup(do_model=False)
+            data_saver(args.epoch_count)
+            print('Done!')
+        else:
+            setupid = progress.add_task('Setting up', total=VALIDATE_N + 2, start=False)
+            doid = progress.add_task('Training', total=args.epoch_count, start=False)
+            progress.start()
 
-    if args.optimized:
-        nn.random_slice = nn.random_slice_fast
-    if args.test_forwards:
-        sl = nn.random_slice_fast()
-        print('Starting test')
-        model = nn.WeatherPredictor()
-        print(calc_loss(sl, needs_grad=False, train_mode=False))
-        print('Success!')
-    elif args.data_cache:
-        setupid = progress.add_task('Setting up', total=VALIDATE_N + 2, start=False)
-        doid = progress.add_task('Saving data', total=args.epoch_count, start=False)
-        progress.start()
-        print('Starting data cache system')
-        setup(do_model=False)
-        data_saver(args.epoch_count)
-        print('Done!')
-    else:
-        setupid = progress.add_task('Setting up', total=VALIDATE_N + 2, start=False)
-        doid = progress.add_task('Training', total=args.epoch_count, start=False)
-        progress.start()
-
-        setup(do_data=not args.optimized)
-        main(epoch_count=args.epoch_count, stop_limit=args.stop_num, save=args.save)
-        progress.stop()
+            setup(do_data=not args.optimized)
+            main(epoch_count=args.epoch_count, stop_limit=args.stop_num, save=args.save, prompt=args.prompt)
